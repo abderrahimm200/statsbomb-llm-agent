@@ -9,9 +9,6 @@ SQL queries, match analysis, insights, and pitch visualizations.
 - StatsBomb-style AFCON 2023 event data (SQLite)
 - Streamlit UI with full debug trace
 
-## Demo
-📽️ Demo video: [LINK HERE]
-
 ## Example Question
 > For Morocco vs South Africa, where did Morocco lose possession most often
 > in the middle third, and what does it say about their build-up?
