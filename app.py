@@ -1,6 +1,6 @@
 import streamlit as st
-
-from foot_app.backend import DB_PATH, SYSTEM_PROMPT, build_afcon_db
+import os 
+from foot_app.backend import DB_PATH, SYSTEM_PROMPT, VISION_TOOL_PROMPT, build_afcon_db
 from foot_app.tools import get_tools
 from foot_app.agent_loop import run_tool_calling_loop
 
@@ -38,6 +38,32 @@ api_key = st.sidebar.text_input(
 )
 
 temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
+vision_supported = model_choice == "Gemini 3 Flash"
+if "vision_enabled" not in st.session_state:
+    st.session_state.vision_enabled = vision_supported
+
+vision_enabled = st.sidebar.checkbox(
+    "Enable vision analysis",
+    key="vision_enabled",
+    help="Uses the selected model if it supports vision, or a separate Gemini key if not.",
+)
+
+vision_model_choice = None
+vision_api_key = ""
+if vision_enabled and not vision_supported:
+    st.sidebar.subheader("Vision Model")
+    vision_model_choice = st.sidebar.selectbox(
+        "Vision model",
+        ["Gemini 3 Flash"],
+        help="Used only for image analysis; the main agent stays on the selected model.",
+    )
+    vision_api_key = st.sidebar.text_input(
+        "Vision API key",
+        type="password",
+        help="Google AI Studio key for the vision model.",
+    )
+elif vision_supported:
+    st.sidebar.caption("Vision analysis will use the selected Gemini model.")
 st.sidebar.divider()
 
 # ----------------------------
@@ -120,9 +146,9 @@ if run_clicked:
 
     # Create executor (and planner for DeepSeek)
     if model_choice == "Gemini 3 Flash":
-        executor = ChatGoogleGenerativeAI(
+        os.environ["GOOGLE_API_KEY"] = api_key
+        planner = executor = ChatGoogleGenerativeAI(
             model="gemini-3-flash-preview",
-            api_key=api_key,
             temperature=temperature,
             max_retries=6,
         )
@@ -141,18 +167,88 @@ if run_clicked:
             temperature=temperature,
         )
 
-        plan_prompt = (
-            "Create a concise numbered plan to answer the user's question using the available tools "
-            "(table_columns, sql_query/sql_to_df, python_viz). "
-            "DO NOT call tools. "
-            "Include: which table(s) to inspect, the SQL strategy, the dataframe columns needed, "
-            "and what plot to generate. Keep it short.\n\n"
-            f"USER QUESTION:\n{prompt.strip()}"
-        )
-        plan_text = str(planner.invoke(plan_prompt).content).strip()[:2000]
-        st.session_state.last_plan = plan_text
+    vision_model = None
+    if vision_enabled:
+        if vision_supported:
+            vision_model = executor
+        else:
+            if not vision_api_key.strip():
+                st.error("Please enter the Vision API key in the sidebar.")
+                st.stop()
+            os.environ["GOOGLE_API_KEY"] = vision_api_key
+            vision_model = ChatGoogleGenerativeAI(
+                model="gemini-3-flash-preview",
+                temperature=temperature,
+                max_retries=6,
+            )
 
-    tools = get_tools()
+    vision_tool_available = bool(vision_model)
+
+    planner_tools = "table_columns, sql_query, sql_to_df, python_viz"
+    vision_plan_rule = ""
+    if vision_tool_available:
+        planner_tools += ", vision_analyze_plot"
+        vision_plan_rule = "- If a plot image needs describing, plan to call vision_analyze_plot after python_viz using the saved plot path.\n"
+
+    plan_prompt = (
+        f"""You are the PLANNER for a football analytics agent working on AFCON 2023 StatsBomb Open Data in SQLite.
+        Your job: output a short, executable plan the EXECUTOR will follow using tools:
+        {planner_tools}.
+
+        CRITICAL RULES:
+        - Do NOT call tools. Do NOT write final SQL results. Only plan steps.
+        - Prefer the fewest tool calls possible.
+        - If the question is match-specific, plan to resolve match_id via the games table FIRST.
+        - Only plan schema checks (table_columns or column_map queries) if a required column is uncertain.
+        - Avoid selecting raw_json unless explicitly required.
+        - For event sequences: include ORDER BY event_index ASC.
+        - For plots: fetch ONLY needed columns; plan 1 sql_to_df + 1 python_viz whenever possible.
+        {vision_plan_rule}
+        OUTPUT FORMAT (STRICT): Return JSON only, no extra text.
+        Schema:
+        {{
+        "task": "one sentence",
+        "needs_plot": true/false,
+        "match_resolution": {{
+            "needed": true/false,
+            "strategy": "how to find match_id(s) from games",
+            "disambiguation": "what to show if multiple matches"
+        }},
+        "schema_checks": [
+            {{"when": "condition", "action": "table_columns('events') OR query column_map", "target": "which fields"}}
+        ],
+        "sql_steps": [
+            {{
+            "tool": "sql_query | sql_to_df",
+            "purpose": "what this query returns",
+            "sql_outline": "SQL skeleton with key filters/joins (no SELECT *)",
+            "expected_columns": ["col1","col2"],
+            "df_name": "only if sql_to_df"
+            }}
+        ],
+        "viz_plan": {{
+            "plot_type": "none | shot_map | pass_map | heatmap | network | sequence_map | bar | line",
+            "pitch": true/false,
+            "required_fields": ["x","y","end_x","end_y","label","color_by"],
+            "grouping": "if any",
+            "annotations": "if any"
+        }},
+        "validation": [
+            "checks on row_count, distinct match_id, entity matches, event types, missing locations"
+        ],
+        "final_response": "how to present the answer (table/bullets + key counts + match context)"
+        }}
+        """
+        f"USER QUESTION:\n{prompt.strip()}"
+    )
+    plan_text = str(planner.invoke(plan_prompt).content).strip()[:2000]
+    st.session_state.last_plan = plan_text
+
+    tools = get_tools(vision_model=vision_model, enable_vision_tool=vision_tool_available)
+
+    system_prompt = SYSTEM_PROMPT
+    if vision_tool_available:
+        system_prompt = f"{SYSTEM_PROMPT}\n\n{VISION_TOOL_PROMPT}"
 
     injected_user_prompt = prompt.strip()
     if plan_text:
@@ -183,7 +279,7 @@ if run_clicked:
         outputs, trace = run_tool_calling_loop(
             model=executor,
             tools=tools,
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             user_prompt=injected_user_prompt,
             max_steps=50,
             on_event=on_event,

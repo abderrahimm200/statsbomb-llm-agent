@@ -222,7 +222,7 @@ def table_info_with_sample(table_name: str) -> Dict[str, Any]:
         return {
             "ok": True,
             "table": table,
-            # "columns": columns,
+            "columns": columns,
             "sample_rows": sample_rows,
         }
 

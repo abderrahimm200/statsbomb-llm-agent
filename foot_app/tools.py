@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import base64
 import glob
 import io
 import json
 import traceback
 import uuid
 from contextlib import redirect_stdout
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 
 from .backend import PLOT_DIR
@@ -17,6 +20,53 @@ from .db import run_sql_readonly, table_info_with_sample, ensure_limit, sanitize
 
 # In-memory dataframe store (plot tool accesses these by name)
 DF_STORE: Dict[str, pd.DataFrame] = {}
+VISION_MODEL = None
+
+_IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+def set_vision_model(model) -> None:
+    global VISION_MODEL
+    VISION_MODEL = model
+
+
+def _coerce_model_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if "text" in item and isinstance(item["text"], str):
+                    parts.append(item["text"])
+                elif "content" in item and isinstance(item["content"], str):
+                    parts.append(item["content"])
+        return "\n".join([p for p in parts if p]).strip()
+    return str(content).strip()
+
+
+def _resolve_image_path(path: str) -> Optional[Path]:
+    if not path:
+        return None
+    p = Path(path)
+    project_root = PLOT_DIR.parent.parent
+    if not p.is_absolute():
+        candidate = (PLOT_DIR / p).resolve()
+        if candidate.exists():
+            p = candidate
+        else:
+            p = (project_root / p).resolve()
+    else:
+        p = p.resolve()
+    return p
 
 
 @tool
@@ -71,7 +121,7 @@ def sql_to_df(sql: str, name: str = "df", limit: int = 50000) -> Dict[str, Any]:
 def python_viz(code: str, dataframes: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Execute plotting code with access to named DataFrames.
-    - Saves any open matplotlib figures into data/plots/
+    - Saves any open matplotlib figures using plt.savefig
     - Returns image paths + stdout + error (if any)
 
     banned imports :
@@ -117,6 +167,10 @@ def python_viz(code: str, dataframes: Optional[List[str]] = None) -> Dict[str, A
 
     try:
         plt.close("all")
+        orig_close = plt.close
+        orig_show = plt.show
+        plt.close = lambda *args, **kwargs: None
+        plt.show = lambda *args, **kwargs: None
 
         with redirect_stdout(stdout_buf):
             exec(code, env, env)
@@ -139,6 +193,76 @@ def python_viz(code: str, dataframes: Optional[List[str]] = None) -> Dict[str, A
 
     except Exception:
         return {"ok": False, "error": traceback.format_exc(), "images": [], "stdout": stdout_buf.getvalue()}
+    finally:
+        plt.close = orig_close
+        plt.show = orig_show
+
+
+@tool
+def vision_analyze_plot(
+    path: str,
+    question: str = "Describe this chart and extract key insights.",
+) -> Dict[str, Any]:
+    """
+    Send a local image to the selected model and return a textual description.
+    """
+    if VISION_MODEL is None:
+        return {
+            "ok": False,
+            "error": "Vision model not configured. Pass vision_model to get_tools().",
+            "text": "",
+        }
+
+    img_path = _resolve_image_path(path)
+    if img_path is None:
+        return {"ok": False, "error": "Image path is required.", "text": ""}
+    if not img_path.exists() or not img_path.is_file():
+        return {"ok": False, "error": f"Image not found: {img_path}", "text": ""}
+
+    mime = _IMAGE_MIME.get(img_path.suffix.lower())
+    if mime is None:
+        return {
+            "ok": False,
+            "error": f"Unsupported image type: {img_path.suffix}",
+            "text": "",
+        }
+
+    prompt = (question or "").strip() or "Describe this chart and extract key insights."
+    data_url = f"data:{mime};base64,{base64.b64encode(img_path.read_bytes()).decode('ascii')}"
+
+    try:
+        msg = HumanMessage(
+            content=[
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]
+        )
+        response = VISION_MODEL.invoke([msg])
+    except Exception:
+        try:
+            msg = HumanMessage(
+                content=[
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": data_url},
+                ]
+            )
+            response = VISION_MODEL.invoke([msg])
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": f"Vision call failed: {e}",
+                "text": "",
+            }
+
+    text = _coerce_model_text(getattr(response, "content", response))
+    if not text:
+        return {
+            "ok": False,
+            "error": "Vision model returned an empty response.",
+            "text": "",
+        }
+
+    return {"ok": True, "text": text, "image_path": str(img_path)}
 
 
 @tool
@@ -159,6 +283,20 @@ def search_mplsoccer_docs(query: str) -> Any:
         return f"search failed: {e}"
 
 
-def get_tools():
+def get_tools(vision_model=None, enable_vision_tool: bool = True):
     # Keep tools list centralized for the agent
-    return [table_columns, sql_query, sql_to_df, python_viz, search_mplsoccer_docs]
+    if enable_vision_tool and vision_model is not None:
+        set_vision_model(vision_model)
+    elif not enable_vision_tool:
+        set_vision_model(None)
+
+    tools = [
+        table_columns,
+        sql_query,
+        sql_to_df,
+        python_viz,
+    ]
+    if enable_vision_tool:
+        tools.append(vision_analyze_plot)
+    tools.append(search_mplsoccer_docs)
+    return tools
